@@ -1,0 +1,6 @@
+cluster:
+  coordinator: A
+  nodes:
+    A: { host: "0.0.0.0", port: 50051, peers: ["B:50052","C:50053"] }
+    B: { host: "0.0.0.0", port: 50052, peers: ["A:50051","C:50053"] }
+    C: { host: "0.0.0.0", port: 50053, peers: ["A:50051","B:50052"] }
