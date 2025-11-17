@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+# tooling
+.coverage
+.pytest_cache/
+# app data
+var/**/logs/
+var/**/snapshots/
