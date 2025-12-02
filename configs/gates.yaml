@@ -1,9 +1,0 @@
-health:
-  window: { seconds: 60, max_requests: 2000 }
-  gates:
-    p95_multiplier: 1.2
-    max_error_rate: 0.005
-smoke_test:
-  warmups: 3
-  max_p95_ms: 150
-  max_rss_mb: 2048
