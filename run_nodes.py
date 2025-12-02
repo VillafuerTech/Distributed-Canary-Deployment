@@ -45,9 +45,9 @@ from distributed_canary.tcp_network import TCPNetwork
 # Peer configuration - supports both localhost and distributed deployment
 # Use environment variables PEERS_NODE_A, PEERS_NODE_B, PEERS_NODE_C for distributed setup
 # Otherwise defaults to localhost (127.0.0.1)
-NODE_A_IP = os.getenv("PEERS_NODE_A", "127.0.0.1")
-NODE_B_IP = os.getenv("PEERS_NODE_B", "127.0.0.1")
-NODE_C_IP = os.getenv("PEERS_NODE_C", "127.0.0.1")
+NODE_A_IP = os.getenv("PEERS_NODE_A", "128.214.11.91")
+NODE_B_IP = os.getenv("PEERS_NODE_B", "128.214.9.25")
+NODE_C_IP = os.getenv("PEERS_NODE_C", "128.214.9.26")
 
 PEERS_CONFIG = {
     "node-a": (NODE_A_IP, 60001),
