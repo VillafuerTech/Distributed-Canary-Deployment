@@ -41,9 +41,9 @@ from distributed_canary.tcp_network import TCPNetwork
 
 
 # Peer configuration - MUST set environment variables for distributed deployment
-NODE_A_IP = os.getenv("PEERS_NODE_A")
-NODE_B_IP = os.getenv("PEERS_NODE_B")
-NODE_C_IP = os.getenv("PEERS_NODE_C")
+NODE_A_IP = os.getenv("PEERS_NODE_A", "128.214.11.91")
+NODE_B_IP = os.getenv("PEERS_NODE_B", "128.214.9.25")
+NODE_C_IP = os.getenv("PEERS_NODE_C", "128.214.9.26")
 
 # All nodes use the same ports (running on different machines)
 CONTROL_PORT = 60001
