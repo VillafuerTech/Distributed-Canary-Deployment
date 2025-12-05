@@ -164,51 +164,72 @@ class Node:
     # DEPLOYMENT (COORDINATOR ONLY)
     # ─────────────────────────────────────────────────────────────
 
-    async def deploy_version(self, new_model_id: str) -> dict:
-        """Deploy a new version to all nodes using 2PC."""
+    async def deploy_version(self, new_model_id: str, max_retries: int = 3, retry_delay: float = 2.0) -> dict:
+        """Deploy a new version to all nodes using 2PC with retry on failure."""
         if self.role != "coordinator":
             return {"error": "only coordinator can deploy"}
         
-        print(f"\n[{self.node_id}] ═══════════════════════════════════════")
-        print(f"[{self.node_id}] DEPLOYING: {self.state.model_id} → {new_model_id}")
-        print(f"[{self.node_id}] ═══════════════════════════════════════\n")
+        for attempt in range(1, max_retries + 1):
+            print(f"\n[{self.node_id}] ═══════════════════════════════════════")
+            print(f"[{self.node_id}] DEPLOYING: {self.state.model_id} → {new_model_id} (attempt {attempt}/{max_retries})")
+            print(f"[{self.node_id}] ═══════════════════════════════════════\n")
+            
+            # Create candidate state (only increment version on first attempt)
+            if attempt == 1:
+                next_version = self.state.version + 1
+            txid = f"deploy-{self.node_id}-{next_version}-{int(time.time())}"
+            
+            candidate = DeploymentState(
+                version=next_version,
+                model_id=new_model_id,
+                status=DeploymentStatus.PREPARED,
+                txid=txid,
+            )
+            
+            # Log locally
+            self.state_log.append(candidate)
+            
+            # Phase 1: Send PREPARE to all participants
+            print(f"[{self.node_id}] Phase 1: Sending PREPARE to {self.peers}")
+            prepare_msg = Message(
+                msg_type=MessageType.PREPARE_REQ,
+                sender=self.node_id,
+                payload={"txid": txid, "state": candidate.to_dict()},
+            )
+            
+            for peer in self.peers:
+                await self.network.send(peer, prepare_msg)
+            
+            # Collect votes
+            decision = await self._collect_votes(txid, expected=len(self.peers))
+            
+            # Phase 2: Broadcast decision
+            print(f"[{self.node_id}] Phase 2: Decision is {decision.value}")
+            await self._broadcast_decision(candidate, decision)
+            
+            if decision == DecisionKind.COMMIT:
+                # Success!
+                return {
+                    "status": "committed",
+                    "model_id": new_model_id,
+                    "version": self.state.version,
+                    "attempts": attempt,
+                }
+            else:
+                # Failed - retry if attempts remaining
+                if attempt < max_retries:
+                    print(f"[{self.node_id}] ✗ Deployment aborted. Retrying in {retry_delay}s...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    print(f"[{self.node_id}] ✗ Deployment failed after {max_retries} attempts.")
         
-        # Create candidate state
-        next_version = self.state.version + 1
-        txid = f"deploy-{self.node_id}-{next_version}-{int(time.time())}"
-        
-        candidate = DeploymentState(
-            version=next_version,
-            model_id=new_model_id,
-            status=DeploymentStatus.PREPARED,
-            txid=txid,
-        )
-        
-        # Log locally
-        self.state_log.append(candidate)
-        
-        # Phase 1: Send PREPARE to all participants
-        print(f"[{self.node_id}] Phase 1: Sending PREPARE to {self.peers}")
-        prepare_msg = Message(
-            msg_type=MessageType.PREPARE_REQ,
-            sender=self.node_id,
-            payload={"txid": txid, "state": candidate.to_dict()},
-        )
-        
-        for peer in self.peers:
-            await self.network.send(peer, prepare_msg)
-        
-        # Collect votes
-        decision = await self._collect_votes(txid, expected=len(self.peers))
-        
-        # Phase 2: Broadcast decision
-        print(f"[{self.node_id}] Phase 2: Decision is {decision.value}")
-        await self._broadcast_decision(candidate, decision)
-        
+        # All retries exhausted
         return {
-            "status": "committed" if decision == DecisionKind.COMMIT else "aborted",
-            "model_id": new_model_id if decision == DecisionKind.COMMIT else self.state.model_id,
+            "status": "aborted",
+            "model_id": self.state.model_id,
             "version": self.state.version,
+            "attempts": max_retries,
+            "error": f"Deployment of {new_model_id} failed after {max_retries} attempts",
         }
 
     async def _collect_votes(self, txid: str, expected: int) -> DecisionKind:

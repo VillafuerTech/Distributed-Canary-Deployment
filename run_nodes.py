@@ -33,17 +33,18 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from distributed_canary.node import Node
 from distributed_canary.tcp_network import TCPNetwork
 
-
+load_dotenv()
 # Peer configuration - MUST set environment variables for distributed deployment
-NODE_A_IP = os.getenv("PEERS_NODE_A", "128.214.11.91")
-NODE_B_IP = os.getenv("PEERS_NODE_B", "128.214.9.25")
-NODE_C_IP = os.getenv("PEERS_NODE_C", "128.214.9.26")
+NODE_A_IP = os.getenv("PEERS_NODE_A")
+NODE_B_IP = os.getenv("PEERS_NODE_B")
+NODE_C_IP = os.getenv("PEERS_NODE_C")
 
 # All nodes use the same ports (running on different machines)
 CONTROL_PORT = 60001
@@ -96,14 +97,19 @@ async def run_coordinator():
 
     await asyncio.sleep(5)  # Wait for participants to start
 
-    # Demo: Deploy v2, then v3
-    print(f"\n[{node.node_id}] Demo: Deploying v2...")
-    await node.deploy_version("v2")
+    # Demo: Deploy v2, then v3 (with automatic retry on failure)
+    print(f"\n[{node.node_id}] Demo: Deploying v2 (with retry)...")
+    result = await node.deploy_version("v2", max_retries=3, retry_delay=2.0)
+    print(f"[{node.node_id}] v2 deployment result: {result}")
     
-    await asyncio.sleep(3)
-    
-    print(f"\n[{node.node_id}] Demo: Deploying v3...")
-    await node.deploy_version("v3")
+    if result["status"] == "committed":
+        await asyncio.sleep(3)
+        
+        print(f"\n[{node.node_id}] Demo: Deploying v3 (with retry)...")
+        result = await node.deploy_version("v3", max_retries=3, retry_delay=2.0)
+        print(f"[{node.node_id}] v3 deployment result: {result}")
+    else:
+        print(f"[{node.node_id}] Skipping v3 deployment since v2 failed.")
 
     # Keep running
     try:
