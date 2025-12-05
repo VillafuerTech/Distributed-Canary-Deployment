@@ -3,15 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import random
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from aiohttp import web
 
 from .messages import DecisionKind, Message, MessageType, Vote
-from .state import RoutingState, RoutingStatus, StateLog
+from .state import DeploymentState, DeploymentStatus, StateLog
 from .tcp_network import TCPNetwork
 
 
@@ -22,8 +21,7 @@ class Node:
         role: str,
         peers: List[str],
         network: TCPNetwork,
-        stable_model_id: str = "v1",
-        canary_model_id: str = "v2",
+        initial_model: str = "v1",
     ) -> None:
         self.node_id = node_id
         self.role = role
@@ -31,54 +29,74 @@ class Node:
         self.network = network
         self.inbox: asyncio.Queue[Message] = asyncio.Queue()
         self.state_log = StateLog(node_id)
+        
+        # Load persisted state or create initial
         persisted = self.state_log.last_state()
         if persisted:
             self.state = persisted
+            print(f"[{node_id}] Recovered state: model={persisted.model_id}, version={persisted.version}")
         else:
-            self.state = RoutingState(
+            self.state = DeploymentState(
                 version=1,
-                stable_model_id=stable_model_id,
-                canary_model_id=canary_model_id,
-                weights={stable_model_id: 1.0, canary_model_id: 0.0},
-                status=RoutingStatus.COMMITTED,
+                model_id=initial_model,
+                status=DeploymentStatus.COMMITTED,
                 txid="initial",
             )
             self.state_log.append(self.state)
-        self.last_committed = (
-            self.state if self.state.status == RoutingStatus.COMMITTED else None
-        )
+        
+        self.last_committed = self.state if self.state.status == DeploymentStatus.COMMITTED else None
         self.running = True
         self._vote_box: Dict[str, List[Vote]] = {}
-        self.health_metric = {"p95": 120.0, "error_rate": 0.1, "n": 0}
+        
+        # Track deployed models
+        self.deployed_models: Dict[str, dict] = {
+            initial_model: {"deployed_at": datetime.utcnow().isoformat(), "status": "active"}
+        }
+        
+        # Health metrics
+        self.health_metric = {"p95": 120.0, "error_rate": 0.01, "n": 0}
+
+    # ─────────────────────────────────────────────────────────────
+    # MESSAGE PROCESSING
+    # ─────────────────────────────────────────────────────────────
 
     async def process_messages(self) -> None:
+        """Main message loop."""
         while self.running:
             try:
                 message = await asyncio.wait_for(self.inbox.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
+
             if message.msg_type == MessageType.PREPARE_REQ:
                 await self._handle_prepare_request(message)
-            elif message.msg_type == MessageType.PREPARE_RESP and self.role == "coordinator":
+            elif message.msg_type == MessageType.PREPARE_RESP:
                 self._handle_prepare_response(message)
             elif message.msg_type == MessageType.DECISION:
                 await self._handle_decision(message)
             elif message.msg_type == MessageType.HEARTBEAT:
                 self._handle_heartbeat(message)
-            elif message.msg_type == MessageType.HEALTH_SNAPSHOT:
-                self._handle_health_snapshot(message)
-            self.inbox.task_done()
 
     async def _handle_prepare_request(self, message: Message) -> None:
+        """Participant receives deploy request from coordinator."""
         payload = message.payload
-        candidate = RoutingState.from_dict(payload["state"])
-        vote_reason = "health gates met"
+        candidate = DeploymentState.from_dict(payload["state"])
+        
+        # Check if we can accept this deployment
         vote = Vote.COMMIT
+        vote_reason = "ready to deploy"
+        
         if not self._passes_health_gate():
             vote = Vote.ABORT
-            vote_reason = "health gate triggered"
-        candidate.status = RoutingStatus.PREPARED
+            vote_reason = "health check failed"
+        
+        # Log the prepared state
+        candidate.status = DeploymentStatus.PREPARED
         self.state_log.append(candidate)
+        
+        print(f"[{self.node_id}] Received deploy request for {candidate.model_id}, voting {vote.value}")
+        
+        # Send vote back
         response = Message(
             msg_type=MessageType.PREPARE_RESP,
             sender=self.node_id,
@@ -87,66 +105,171 @@ class Node:
         await self.network.send(message.sender, response)
 
     def _handle_prepare_response(self, message: Message) -> None:
+        """Coordinator collects votes from participants."""
         txid = message.payload["txid"]
         vote = Vote(message.payload["vote"])
+        reason = message.payload.get("reason", "")
+        
+        print(f"[{self.node_id}] Received vote {vote.value} from {message.sender}: {reason}")
         self._vote_box.setdefault(txid, []).append(vote)
 
     async def _handle_decision(self, message: Message) -> None:
+        """Participant applies the coordinator's decision."""
         payload = message.payload
         decision = DecisionKind(payload["kind"])
-        state = RoutingState.from_dict(payload["state"])
+        state = DeploymentState.from_dict(payload["state"])
+        
         await self._apply_decision(state, decision)
 
     def _handle_heartbeat(self, message: Message) -> None:
-        digest = message.payload.get("digest")
-        version = message.payload.get("last_committed_version")
-        # Heartbeats allow visibility but do not change local state in this prototype.
-        print(f"{self.node_id} received heartbeat from {message.sender}: v{version} digest {digest}")
-
-    def _handle_health_snapshot(self, message: Message) -> None:
-        info = message.payload
-        print(f"{self.node_id} sees peer {info['node_id']} p95={info['p95']} err={info['error_rate']:.2%}")
+        """Handle heartbeat from peer."""
+        model = message.payload.get("model_id")
+        version = message.payload.get("version")
+        print(f"[{self.node_id}] Heartbeat from {message.sender}: model={model}, v{version}")
 
     def _passes_health_gate(self) -> bool:
-        self.health_metric["n"] += 1
-        self.health_metric["p95"] = max(60.0, self.health_metric["p95"] + random.uniform(-5, 5))
-        self.health_metric["error_rate"] = max(0.01, self.health_metric["error_rate"] + random.uniform(-0.01, 0.01))
-        # Health gates: p95 <= 200ms, error_rate <= 5%
+        """Check if node is healthy enough to accept deployment."""
         return self.health_metric["p95"] <= 200 and self.health_metric["error_rate"] <= 0.05
 
-    async def _apply_decision(self, state: RoutingState, decision: DecisionKind) -> None:
+    async def _apply_decision(self, state: DeploymentState, decision: DecisionKind) -> None:
+        """Apply commit or abort decision."""
         if decision == DecisionKind.COMMIT:
-            state.status = RoutingStatus.COMMITTED
+            state.status = DeploymentStatus.COMMITTED
             self.state = state
             self.last_committed = state
             self.state_log.append(state)
+            
+            # Update deployed models
+            self.deployed_models[state.model_id] = {
+                "deployed_at": datetime.utcnow().isoformat(),
+                "status": "active"
+            }
+            
+            print(f"[{self.node_id}] ✓ COMMITTED: Now running {state.model_id}")
         else:
-            abort_state = RoutingState(
+            abort_state = DeploymentState(
                 version=state.version,
-                stable_model_id=state.stable_model_id,
-                canary_model_id=state.canary_model_id,
-                weights=state.weights,
-                status=RoutingStatus.ABORTED,
+                model_id=self.last_committed.model_id if self.last_committed else "v1",
+                status=DeploymentStatus.ABORTED,
                 txid=state.txid,
             )
             self.state_log.append(abort_state)
+            
             if self.last_committed:
                 self.state = self.last_committed
+            
+            print(f"[{self.node_id}] ✗ ABORTED: Staying on {self.state.model_id}")
+
+    # ─────────────────────────────────────────────────────────────
+    # DEPLOYMENT (COORDINATOR ONLY)
+    # ─────────────────────────────────────────────────────────────
+
+    async def deploy_version(self, new_model_id: str) -> dict:
+        """Deploy a new version to all nodes using 2PC."""
+        if self.role != "coordinator":
+            return {"error": "only coordinator can deploy"}
+        
+        print(f"\n[{self.node_id}] ═══════════════════════════════════════")
+        print(f"[{self.node_id}] DEPLOYING: {self.state.model_id} → {new_model_id}")
+        print(f"[{self.node_id}] ═══════════════════════════════════════\n")
+        
+        # Create candidate state
+        next_version = self.state.version + 1
+        txid = f"deploy-{self.node_id}-{next_version}-{int(time.time())}"
+        
+        candidate = DeploymentState(
+            version=next_version,
+            model_id=new_model_id,
+            status=DeploymentStatus.PREPARED,
+            txid=txid,
+        )
+        
+        # Log locally
+        self.state_log.append(candidate)
+        
+        # Phase 1: Send PREPARE to all participants
+        print(f"[{self.node_id}] Phase 1: Sending PREPARE to {self.peers}")
+        prepare_msg = Message(
+            msg_type=MessageType.PREPARE_REQ,
+            sender=self.node_id,
+            payload={"txid": txid, "state": candidate.to_dict()},
+        )
+        
+        for peer in self.peers:
+            await self.network.send(peer, prepare_msg)
+        
+        # Collect votes
+        decision = await self._collect_votes(txid, expected=len(self.peers))
+        
+        # Phase 2: Broadcast decision
+        print(f"[{self.node_id}] Phase 2: Decision is {decision.value}")
+        await self._broadcast_decision(candidate, decision)
+        
+        return {
+            "status": "committed" if decision == DecisionKind.COMMIT else "aborted",
+            "model_id": new_model_id if decision == DecisionKind.COMMIT else self.state.model_id,
+            "version": self.state.version,
+        }
+
+    async def _collect_votes(self, txid: str, expected: int) -> DecisionKind:
+        """Wait for votes from all participants."""
+        deadline = time.monotonic() + 3.0  # 3 second timeout
+        
+        while time.monotonic() < deadline:
+            votes = self._vote_box.get(txid, [])
+            if len(votes) >= expected:
+                break
+            await asyncio.sleep(0.1)
+        
+        votes = self._vote_box.pop(txid, [])
+        
+        if len(votes) < expected:
+            print(f"[{self.node_id}] Timeout: only {len(votes)}/{expected} votes received")
+            return DecisionKind.ABORT
+        
+        if all(v == Vote.COMMIT for v in votes):
+            return DecisionKind.COMMIT
+        else:
+            return DecisionKind.ABORT
+
+    async def _broadcast_decision(self, state: DeploymentState, decision: DecisionKind) -> None:
+        """Send decision to all participants and apply locally."""
+        decision_msg = Message(
+            msg_type=MessageType.DECISION,
+            sender=self.node_id,
+            payload={"kind": decision.value, "state": state.to_dict()},
+        )
+        
+        for peer in self.peers:
+            await self.network.send(peer, decision_msg)
+        
+        # Apply locally
+        await self._apply_decision(state, decision)
+
+    # ─────────────────────────────────────────────────────────────
+    # HEARTBEAT & HEALTH
+    # ─────────────────────────────────────────────────────────────
 
     async def send_heartbeat_loop(self) -> None:
+        """Periodically send heartbeats to peers."""
         while self.running:
-            digest = self._digest()
-            heartbeat = {
-                "node_id": self.node_id,
-                "last_committed_version": self.last_committed.version if self.last_committed else 0,
-                "digest": digest,
-            }
+            await asyncio.sleep(2.0)
+            
+            heartbeat = Message(
+                msg_type=MessageType.HEARTBEAT,
+                sender=self.node_id,
+                payload={
+                    "model_id": self.state.model_id,
+                    "version": self.state.version,
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+            )
+            
             for peer in self.peers:
-                await self.network.send(
-                    peer,
-                    Message(msg_type=MessageType.HEARTBEAT, sender=self.node_id, payload=heartbeat),
-                )
-            await asyncio.sleep(2)
+                try:
+                    await self.network.send(peer, heartbeat)
+                except Exception:
+                    pass
 
     def _digest(self) -> str:
         if not self.last_committed:
@@ -154,126 +277,102 @@ class Node:
         serialized = json.dumps(self.last_committed.to_dict(), sort_keys=True).encode("utf-8")
         return hashlib.sha256(serialized).hexdigest()
 
-    async def send_health_snapshots(self) -> None:
-        snap = {
-            "node_id": self.node_id,
-            "p95": self.health_metric["p95"],
-            "error_rate": self.health_metric["error_rate"],
-            "window_id": f"window-{int(time.time())}",
-        }
-        for peer in self.peers:
-            await self.network.send(
-                peer,
-                Message(msg_type=MessageType.HEALTH_SNAPSHOT, sender=self.node_id, payload=snap),
-            )
-
-    def _health_snapshot_payload(self) -> Dict[str, object]:
-        return {
-            "node_id": self.node_id,
-            "p95": self.health_metric["p95"],
-            "error_rate": self.health_metric["error_rate"],
-            "window_id": f"window-{int(time.time())}",
-            "last_committed_version": self.last_committed.version if self.last_committed else 0,
-            "digest": self._digest(),
-        }
-
-    async def initiate_rollout(self, canary_share: float = 0.05) -> None:
-        if self.role != "coordinator":
-            raise RuntimeError("only the coordinator initiates rollouts")
-        target_weights = {
-            self.state.stable_model_id: max(0.0, 1.0 - canary_share),
-            self.state.canary_model_id: max(0.0, canary_share),
-        }
-        next_version = self.state.version + 1
-        txid = f"promote-{self.node_id}-{next_version}-{datetime.utcnow().isoformat()}"
-        candidate = RoutingState(
-            version=next_version,
-            stable_model_id=self.state.stable_model_id,
-            canary_model_id=self.state.canary_model_id,
-            weights=target_weights,
-            status=RoutingStatus.PREPARED,
-            txid=txid,
-        )
-        self.state_log.append(candidate)
-        prepare = Message(msg_type=MessageType.PREPARE_REQ, sender=self.node_id, payload={
-            "txid": txid,
-            "state": candidate.to_dict(),
-        })
-        for peer in self.peers:
-            await self.network.send(peer, prepare)
-        decision = await self._collect_votes(txid, len(self.peers))
-        await self._broadcast_decision(candidate, decision)
-
-    async def _collect_votes(self, txid: str, expected: int) -> DecisionKind:
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            votes = self._vote_box.get(txid, [])
-            if len(votes) >= expected:
-                break
-            await asyncio.sleep(0.1)
-        votes = self._vote_box.pop(txid, [])
-        if len(votes) < expected:
-            return DecisionKind.ABORT
-        return DecisionKind.COMMIT if all(vote == Vote.COMMIT for vote in votes) else DecisionKind.ABORT
-
-    async def _broadcast_decision(self, state: RoutingState, decision: DecisionKind) -> None:
-        payload_state = state
-        payload_state.status = RoutingStatus.COMMITTED if decision == DecisionKind.COMMIT else RoutingStatus.ABORTED
-        payload = {
-            "txid": state.txid,
-            "kind": decision.value,
-            "state": payload_state.to_dict(),
-        }
-        for peer in self.peers:
-            await self.network.send(
-                peer,
-                Message(msg_type=MessageType.DECISION, sender=self.node_id, payload=payload),
-            )
-        await self._apply_decision(payload_state, decision)
-
-    def _choose_model(self) -> str:
-        rnd = random.random()
-        cumulative = 0.0
-        for model_id, weight in self.state.weights.items():
-            cumulative += weight
-            if rnd <= cumulative:
-                return model_id
-        return max(self.state.weights, key=self.state.weights.get)
+    # ─────────────────────────────────────────────────────────────
+    # DATA PLANE (HTTP API)
+    # ─────────────────────────────────────────────────────────────
 
     async def start_data_plane(self, port: int) -> None:
+        """HTTP server for deployment API and health checks."""
         app = web.Application()
 
-        async def handle_routing_state(_: web.Request) -> web.Response:
+        async def handle_state(_: web.Request) -> web.Response:
+            """Get current deployment state."""
             return web.json_response(self.state.to_dict())
 
-        async def handle_health_snapshot(_: web.Request) -> web.Response:
-            return web.json_response(self._health_snapshot_payload())
+        async def handle_health(_: web.Request) -> web.Response:
+            """Get health metrics."""
+            return web.json_response({
+                "node_id": self.node_id,
+                "model_id": self.state.model_id,
+                "version": self.state.version,
+                "health": self.health_metric,
+                "status": "healthy" if self._passes_health_gate() else "unhealthy",
+            })
+
+        async def handle_models(_: web.Request) -> web.Response:
+            """List deployed models."""
+            return web.json_response({
+                "current": self.state.model_id,
+                "models": self.deployed_models,
+            })
+
+        async def handle_deploy(request: web.Request) -> web.Response:
+            """Deploy a new version (coordinator only)."""
+            if self.role != "coordinator":
+                return web.json_response({"error": "only coordinator can deploy"}, status=403)
+            
+            try:
+                data = await request.json()
+                model_id = data.get("model_id")
+                
+                if not model_id:
+                    return web.json_response({"error": "model_id required"}, status=400)
+                
+                if model_id == self.state.model_id:
+                    return web.json_response({"error": f"already running {model_id}"}, status=400)
+                
+                result = await self.deploy_version(model_id)
+                return web.json_response(result)
+                
+            except json.JSONDecodeError:
+                return web.json_response({"error": "invalid JSON"}, status=400)
+
+        async def handle_rollback(_: web.Request) -> web.Response:
+            """Rollback to previous version (coordinator only)."""
+            if self.role != "coordinator":
+                return web.json_response({"error": "only coordinator can rollback"}, status=403)
+            
+            if not self.last_committed:
+                return web.json_response({"error": "no previous version"}, status=400)
+            
+            # Find previous model
+            models = list(self.deployed_models.keys())
+            if len(models) < 2:
+                return web.json_response({"error": "no previous version available"}, status=400)
+            
+            previous = models[-2] if models[-1] == self.state.model_id else models[-1]
+            result = await self.deploy_version(previous)
+            return web.json_response(result)
 
         async def handle_predict(request: web.Request) -> web.Response:
+            """Handle prediction request (routes to current model)."""
             try:
                 payload = await request.json()
             except json.JSONDecodeError:
                 payload = {}
-            selected = self._choose_model()
-            response = {
-                "model_selected": selected,
-                "routing_state": self.state.to_dict(),
+            
+            return web.json_response({
+                "model": self.state.model_id,
+                "version": self.state.version,
                 "input": payload,
-            }
-            return web.json_response(response)
+                "prediction": f"result_from_{self.state.model_id}",
+            })
 
-        app.add_routes(
-            [
-                web.get("/routing/state", handle_routing_state),
-                web.get("/health/snapshot", handle_health_snapshot),
-                web.post("/predict", handle_predict),
-            ]
-        )
+        app.add_routes([
+            web.get("/state", handle_state),
+            web.get("/health", handle_health),
+            web.get("/models", handle_models),
+            web.post("/deploy", handle_deploy),
+            web.post("/rollback", handle_rollback),
+            web.post("/predict", handle_predict),
+        ])
+
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", port)
+        site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        print(f"{self.node_id} data plane listening on 127.0.0.1:{port}")
+        print(f"[{self.node_id}] Data plane on http://0.0.0.0:{port}")
+
         try:
             while self.running:
                 await asyncio.sleep(0.5)

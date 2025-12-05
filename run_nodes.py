@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
 """
-Distributed Canary Deployment System - All-in-One Node Launcher
+Simple Distributed Deployment System - Version Rollout with 2PC
 
-Runs all three nodes (Coordinator A, Participant B, Participant C) as separate 
-processes in a single script. Each node listens on its own control and data plane ports.
-
-Supports both localhost (single machine) and distributed deployment (3 machines).
-
-Usage (Single Machine - Localhost):
-    python run_nodes.py [coordinator|participant_b|participant_c]
-    python run_nodes.py  # Run all 3 nodes
+Deploys new versions atomically to all nodes using 2-Phase Commit.
+Each node runs on a separate physical machine.
 
 Usage (Distributed - 3 Machines):
     # Machine 1 (Coordinator):
-    export PEERS_NODE_A=192.168.1.10
-    export PEERS_NODE_B=192.168.1.20
-    export PEERS_NODE_C=192.168.1.30
+    export PEERS_NODE_A=<Machine1_IP>
+    export PEERS_NODE_B=<Machine2_IP>
+    export PEERS_NODE_C=<Machine3_IP>
     python run_nodes.py coordinator
     
     # Machine 2 (Participant B):
-    export PEERS_NODE_A=192.168.1.10
-    export PEERS_NODE_B=192.168.1.20
-    export PEERS_NODE_C=192.168.1.30
+    export PEERS_NODE_A=<Machine1_IP>
+    export PEERS_NODE_B=<Machine2_IP>
+    export PEERS_NODE_C=<Machine3_IP>
     python run_nodes.py participant_b
     
     # Machine 3 (Participant C):
-    export PEERS_NODE_A=192.168.1.10
-    export PEERS_NODE_B=192.168.1.20
-    export PEERS_NODE_C=192.168.1.30
+    export PEERS_NODE_A=<Machine1_IP>
+    export PEERS_NODE_B=<Machine2_IP>
+    export PEERS_NODE_C=<Machine3_IP>
     python run_nodes.py participant_c
+
+Ports:
+    - Control Plane (TCP): 60001 (all nodes use same port on different machines)
+    - Data Plane (HTTP):   50051 (all nodes use same port on different machines)
 """
 
 import asyncio
@@ -42,155 +40,122 @@ from distributed_canary.node import Node
 from distributed_canary.tcp_network import TCPNetwork
 
 
-# Peer configuration - supports both localhost and distributed deployment
-# Use environment variables PEERS_NODE_A, PEERS_NODE_B, PEERS_NODE_C for distributed setup
-# Otherwise defaults to localhost (127.0.0.1)
-NODE_A_IP = os.getenv("PEERS_NODE_A", "128.214.11.91")
-NODE_B_IP = os.getenv("PEERS_NODE_B", "128.214.9.25")
-NODE_C_IP = os.getenv("PEERS_NODE_C", "128.214.9.26")
+# Peer configuration - MUST set environment variables for distributed deployment
+NODE_A_IP = os.getenv("PEERS_NODE_A")
+NODE_B_IP = os.getenv("PEERS_NODE_B")
+NODE_C_IP = os.getenv("PEERS_NODE_C")
+
+# All nodes use the same ports (running on different machines)
+CONTROL_PORT = 60001
+DATA_PORT = 50051
 
 PEERS_CONFIG = {
-    "node-a": (NODE_A_IP, 60001),
-    "node-b": (NODE_B_IP, 60002),
-    "node-c": (NODE_C_IP, 60003),
+    "node-a": (NODE_A_IP, CONTROL_PORT),
+    "node-b": (NODE_B_IP, CONTROL_PORT),
+    "node-c": (NODE_C_IP, CONTROL_PORT),
 }
 
-# Data plane ports for each node
-DATA_PLANE_PORTS = {
-    "node-a": 50051,
-    "node-b": 50052,
-    "node-c": 50053,
-}
+
+def check_env_vars():
+    """Ensure all required environment variables are set."""
+    missing = []
+    if not NODE_A_IP:
+        missing.append("PEERS_NODE_A")
+    if not NODE_B_IP:
+        missing.append("PEERS_NODE_B")
+    if not NODE_C_IP:
+        missing.append("PEERS_NODE_C")
+    
+    if missing:
+        print("ERROR: Missing required environment variables:")
+        for var in missing:
+            print(f"  - {var}")
+        print("\nSet them with your machine IPs:")
+        print("  export PEERS_NODE_A=<Machine1_IP>")
+        print("  export PEERS_NODE_B=<Machine2_IP>")
+        print("  export PEERS_NODE_C=<Machine3_IP>")
+        sys.exit(1)
 
 
 async def run_coordinator():
-    """Run node-a as the coordinator on all interfaces port 60001."""
+    """Run coordinator node (Machine 1)."""
     network = TCPNetwork(PEERS_CONFIG)
     node = Node("node-a", "coordinator", ["node-a", "node-b", "node-c"], network)
 
-    # Start listening for peer connections (0.0.0.0 = all interfaces)
-    listen_task = asyncio.create_task(
-        network.start_listening("0.0.0.0", 60001, node.inbox.put)
-    )
-
-    # Start processing messages, heartbeats, health snapshots, data plane
+    listen_task = asyncio.create_task(network.start_listening("0.0.0.0", CONTROL_PORT, node.inbox.put))
     msg_task = asyncio.create_task(node.process_messages())
     hb_task = asyncio.create_task(node.send_heartbeat_loop())
-    health_task = asyncio.create_task(node.send_health_snapshots())
-    data_plane_task = asyncio.create_task(node.start_data_plane(50051))
+    data_plane_task = asyncio.create_task(node.start_data_plane(DATA_PORT))
 
-    print(f"[{node.node_id}] Coordinator started, listening on 0.0.0.0:60001")
-    print(f"[{node.node_id}] Data plane on 0.0.0.0:50051")
-    print(f"[{node.node_id}] Peers: {PEERS_CONFIG}")
+    print(f"\n[{node.node_id}] Coordinator ready")
+    print(f"[{node.node_id}] Current model: {node.state.model_id}")
+    print(f"[{node.node_id}] Control plane: 0.0.0.0:{CONTROL_PORT}")
+    print(f"[{node.node_id}] Data plane:    http://0.0.0.0:{DATA_PORT}")
+    print(f"[{node.node_id}] Peers: node-a={NODE_A_IP}, node-b={NODE_B_IP}, node-c={NODE_C_IP}")
+    print(f"\n[{node.node_id}] Waiting for participants to connect...\n")
 
-    # Allow tasks to warm up before initiating rollouts
-    await asyncio.sleep(2)
+    await asyncio.sleep(5)  # Wait for participants to start
 
+    # Demo: Deploy v2, then v3
+    print(f"\n[{node.node_id}] Demo: Deploying v2...")
+    await node.deploy_version("v2")
+    
+    await asyncio.sleep(3)
+    
+    print(f"\n[{node.node_id}] Demo: Deploying v3...")
+    await node.deploy_version("v3")
+
+    # Keep running
     try:
-        print(f"[{node.node_id}] Initiating first rollout (5% canary)...")
-        await node.initiate_rollout(canary_share=0.05)
-        await asyncio.sleep(2)
-
-        print(f"[{node.node_id}] Extending to 20% canary...")
-        await node.initiate_rollout(canary_share=0.2)
-        await asyncio.sleep(2)
-
-        print(f"[{node.node_id}] Extending to 50% canary...")
-        await node.initiate_rollout(canary_share=0.5)
-        await asyncio.sleep(5)
+        await asyncio.gather(listen_task, msg_task, hb_task, data_plane_task)
     except KeyboardInterrupt:
-        pass
-    finally:
         node.running = False
 
 
-async def run_participant_b():
-    """Run node-b as a participant on all interfaces port 60002."""
+async def run_participant(node_id: str):
+    """Run participant node (Machine 2 or 3)."""
     network = TCPNetwork(PEERS_CONFIG)
-    node = Node("node-b", "participant", ["node-a", "node-b", "node-c"], network)
+    node = Node(node_id, "participant", ["node-a", "node-b", "node-c"], network)
 
-    # Start listening for peer connections (0.0.0.0 = all interfaces)
-    listen_task = asyncio.create_task(
-        network.start_listening("0.0.0.0", 60002, node.inbox.put)
-    )
-
-    # Start processing messages, heartbeats, health snapshots, data plane
+    listen_task = asyncio.create_task(network.start_listening("0.0.0.0", CONTROL_PORT, node.inbox.put))
     msg_task = asyncio.create_task(node.process_messages())
     hb_task = asyncio.create_task(node.send_heartbeat_loop())
-    health_task = asyncio.create_task(node.send_health_snapshots())
-    data_plane_task = asyncio.create_task(node.start_data_plane(50052))
+    data_plane_task = asyncio.create_task(node.start_data_plane(DATA_PORT))
 
-    print(f"[{node.node_id}] Participant started, listening on 0.0.0.0:60002")
-    print(f"[{node.node_id}] Data plane on 0.0.0.0:50052")
-    print(f"[{node.node_id}] Peers: {PEERS_CONFIG}")
-
-    try:
-        await asyncio.gather(
-            listen_task, msg_task, hb_task, health_task, data_plane_task
-        )
-    except KeyboardInterrupt:
-        node.running = False
-        print(f"[{node.node_id}] Shutting down...")
-
-
-async def run_participant_c():
-    """Run node-c as a participant on all interfaces port 60003."""
-    network = TCPNetwork(PEERS_CONFIG)
-    node = Node("node-c", "participant", ["node-a", "node-b", "node-c"], network)
-
-    # Start listening for peer connections (0.0.0.0 = all interfaces)
-    listen_task = asyncio.create_task(
-        network.start_listening("0.0.0.0", 60003, node.inbox.put)
-    )
-
-    # Start processing messages, heartbeats, health snapshots, data plane
-    msg_task = asyncio.create_task(node.process_messages())
-    hb_task = asyncio.create_task(node.send_heartbeat_loop())
-    health_task = asyncio.create_task(node.send_health_snapshots())
-    data_plane_task = asyncio.create_task(node.start_data_plane(50053))
-
-    print(f"[{node.node_id}] Participant started, listening on 0.0.0.0:60003")
-    print(f"[{node.node_id}] Data plane on 0.0.0.0:50053")
-    print(f"[{node.node_id}] Peers: {PEERS_CONFIG}")
+    print(f"\n[{node.node_id}] Participant ready")
+    print(f"[{node.node_id}] Current model: {node.state.model_id}")
+    print(f"[{node.node_id}] Control plane: 0.0.0.0:{CONTROL_PORT}")
+    print(f"[{node.node_id}] Data plane:    http://0.0.0.0:{DATA_PORT}")
+    print(f"[{node.node_id}] Peers: node-a={NODE_A_IP}, node-b={NODE_B_IP}, node-c={NODE_C_IP}\n")
 
     try:
-        await asyncio.gather(
-            listen_task, msg_task, hb_task, health_task, data_plane_task
-        )
+        await asyncio.gather(listen_task, msg_task, hb_task, data_plane_task)
     except KeyboardInterrupt:
         node.running = False
-        print(f"[{node.node_id}] Shutting down...")
-
-
-async def run_all_nodes():
-    """Run all three nodes concurrently."""
-    await asyncio.gather(
-        run_coordinator(),
-        run_participant_b(),
-        run_participant_c(),
-        return_exceptions=True,
-    )
 
 
 def main():
     """Main entry point."""
-    if len(sys.argv) > 1:
-        # Run specific node
-        node_type = sys.argv[1].lower()
-        if node_type == "coordinator":
-            asyncio.run(run_coordinator())
-        elif node_type == "participant_b":
-            asyncio.run(run_participant_b())
-        elif node_type == "participant_c":
-            asyncio.run(run_participant_c())
-        else:
-            print(f"Unknown node type: {node_type}")
-            print("Usage: python run_nodes.py [coordinator|participant_b|participant_c]")
-            sys.exit(1)
+    if len(sys.argv) < 2:
+        print("ERROR: You must specify a node type.")
+        print("\nUsage: python run_nodes.py <coordinator|participant_b|participant_c>")
+        print("\nThis system requires 3 separate machines.")
+        print("Run one node type per machine.")
+        sys.exit(1)
+    
+    check_env_vars()
+    
+    node_type = sys.argv[1].lower()
+    if node_type == "coordinator":
+        asyncio.run(run_coordinator())
+    elif node_type == "participant_b":
+        asyncio.run(run_participant("node-b"))
+    elif node_type == "participant_c":
+        asyncio.run(run_participant("node-c"))
     else:
-        # Run all nodes together
-        print("Starting all three nodes...\n")
-        asyncio.run(run_all_nodes())
+        print(f"Unknown node type: {node_type}")
+        print("Usage: python run_nodes.py <coordinator|participant_b|participant_c>")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
